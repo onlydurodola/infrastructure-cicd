@@ -7,6 +7,9 @@ backend_runtime_packages:
   - python3-venv
   - python3-pip
   - postgresql-client
+  - nginx
+  - certbot
+  - python3-certbot-nginx
 
 db_name: taskapp
 db_user: taskapp_user

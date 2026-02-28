@@ -1,12 +1,13 @@
 ---
-# tasks file for roles/backend
-#
+# tasks file for backend
+# This configures the server AND deploys initial code
+# GitHub Actions will handle subsequent deployments
+
 - name: Install backend runtime
   apt:
     name: "{{ backend_runtime_packages }}"
-    states:
-      - started
-      - present
+    state: present
+    update_cache: yes
 
 - name: Create backend application directory
   file:
@@ -28,19 +29,9 @@
     dest: "{{ backend_app_dir }}"
     version: "{{ backend_branch }}"
     clone: yes
-    update: no   # don't pull yet
+    update: no
   become_user: "{{ app_user }}"
   when: not repo_git_dir.stat.exists
-
-- name: Update backend repository (pull if already cloned)
-  git:
-    repo: "{{ backend_repo_url }}"
-    dest: "{{ backend_app_dir }}"
-    version: "{{ backend_branch }}"
-    update: yes
-    force: yes   # if you want to overwrite local changes
-  become_user: "{{ app_user }}"
-  when: repo_git_dir.stat.exists
 
 - name: Create Python virtual environment
   command: python3 -m venv {{ backend_venv_dir }}
@@ -49,69 +40,19 @@
   become_user: "{{ app_user }}"
 
 - name: Create backend environment file
-  copy:
+  template:
+    src: env.j2
     dest: "{{ backend_app_dir }}/.env"
     owner: "{{ app_user }}"
     group: "{{ app_group }}"
     mode: "0600"
-    content: |
-      DATABASE_HOST={{ terraform_output.db_endpoint.value | split(':') | first }}
-      DATABASE_PORT={{ terraform_output.db_endpoint.value | split(':') | last | default('5432') }}
-      DATABASE_NAME={{ db_name }}
-      DATABASE_USER={{ db_user }}
-      DATABASE_PASSWORD={{ db_password }}
-      FLASK_ENV=development
-      FLASK_DEBUG=1
-      SECRET_KEY=hioJTg56FGDYGujoudnGT+$3klshb!!
-      
-- name: Check if tasks table exists (using psql)
-  become_user: "{{ app_user }}"
-  environment:
-    PGPASSWORD: "{{ db_password }}"
-  shell: |
-    psql -h {{ terraform_output.db_endpoint.value | split(':') | first }} \
-         -p {{ terraform_output.db_endpoint.value | split(':') | last | default('5432') }} \
-         -U {{ db_user }} \
-         -d {{ db_name }} \
-         -t -c "SELECT to_regclass('public.tasks');"
-  register: table_check
-  changed_when: false
-  failed_when: false
-
-- name: Check number of tasks if table exists
-  become_user: "{{ app_user }}"
-  environment:
-    PGPASSWORD: "{{ db_password }}"
-  shell: |
-    psql -h {{ terraform_output.db_endpoint.value | split(':') | first }} \
-         -p {{ terraform_output.db_endpoint.value | split(':') | last | default('5432') }} \
-         -U {{ db_user }} \
-         -d {{ db_name }} \
-         -t -c "SELECT COUNT(*) FROM tasks;"
-  register: task_count
-  changed_when: false
-  failed_when: false
-  when: table_check.stdout.strip() != "" and table_check.stdout.strip() != "NULL"
-
-- name: Apply database schema if table missing or empty
-  become_user: "{{ app_user }}"
-  environment:
-    PGPASSWORD: "{{ db_password }}"
-  command: |
-    psql -h {{ terraform_output.db_endpoint.value | split(':') | first }} \
-         -p {{ terraform_output.db_endpoint.value | split(':') | last | default('5432') }} \
-         -U {{ db_user }} \
-         -d {{ db_name }} \
-         -f {{ backend_app_dir }}/schema.sql
-  when: >
-    table_check.stdout.strip() in ["", "NULL"] or
-    (task_count.stdout.strip() is defined and task_count.stdout.strip() == "0")
 
 - name: Install backend Python requirements
   pip:
     requirements: "{{ backend_app_dir }}/requirements.txt"
     virtualenv: "{{ backend_venv_dir }}"
     virtualenv_python: python3
+  become_user: "{{ app_user }}"
 
 - name: Install backend systemd unit
   template:
@@ -128,3 +69,29 @@
     name: taskapp-backend
     enabled: true
     state: started
+
+- name: Create nginx config for backend
+  template:
+    src: nginx-backend.conf.j2
+    dest: /etc/nginx/sites-available/taskapp-backend
+    mode: "0644"
+  notify: Reload nginx
+
+- name: Enable backend nginx site
+  file:
+    src: /etc/nginx/sites-available/taskapp-backend
+    dest: /etc/nginx/sites-enabled/taskapp-backend
+    state: link
+  notify: Reload nginx
+
+- name: Remove default nginx site
+  file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  notify: Reload nginx
+
+- name: Ensure nginx is running
+  service:
+    name: nginx
+    state: started
+    enabled: true
